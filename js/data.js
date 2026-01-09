@@ -1,37 +1,21 @@
-// data.js - All data fetching functions
+// data.js - All data fetching functions with service layer integration
 
 import { CORS_PROXIES, ALERT_KEYWORDS, SECTORS, COMMODITIES, INTEL_SOURCES, AI_FEEDS } from './constants.js';
+import { serviceClient } from './services/index.js';
 
-// Fetch with proxy fallback
+// Fetch with proxy fallback - now uses ServiceClient
 export async function fetchWithProxy(url) {
-    for (let i = 0; i < CORS_PROXIES.length; i++) {
-        try {
-            const proxy = CORS_PROXIES[i];
-            const response = await fetch(proxy + encodeURIComponent(url), {
-                headers: { 'Accept': 'application/rss+xml, application/xml, text/xml, */*' }
-            });
-            if (response.ok) {
-                const text = await response.text();
-                // Check if response is valid (not an error page)
-                if (text && !text.includes('<!DOCTYPE html>') && !text.includes('error code:')) {
-                    return text;
-                }
-            }
-        } catch (e) {
-            console.log(`Proxy ${i} failed, trying next...`);
-        }
-    }
-    throw new Error('All proxies failed');
+    return serviceClient.fetchWithProxy(url);
 }
 
-// Fetch RSS feed using rss2json API as primary method
+// Fetch RSS feed using rss2json API as primary method - now with caching
 export async function fetchFeedViaJson(source) {
     try {
-        const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(source.url)}`;
-        const response = await fetch(apiUrl);
-        if (!response.ok) throw new Error('rss2json API failed');
+        const result = await serviceClient.request('RSS2JSON', '/v1/api.json', {
+            params: { rss_url: source.url }
+        });
 
-        const data = await response.json();
+        const data = result.data;
         if (data.status !== 'ok' || !data.items) return [];
 
         return data.items.slice(0, 5).map(item => ({
@@ -39,7 +23,8 @@ export async function fetchFeedViaJson(source) {
             title: (item.title || 'No title').trim(),
             link: item.link || '',
             pubDate: item.pubDate || '',
-            isAlert: hasAlertKeyword(item.title || '')
+            isAlert: hasAlertKeyword(item.title || ''),
+            _cached: result.fromCache || false
         }));
     } catch (e) {
         console.log(`rss2json failed for ${source.name}, trying XML proxy...`);
@@ -193,7 +178,7 @@ export async function fetchQuote(symbol) {
     return null;
 }
 
-// Fetch market data (stocks + crypto)
+// Fetch market data (stocks + crypto) - crypto now uses ServiceClient with caching
 export async function fetchMarkets() {
     const markets = [];
 
@@ -239,16 +224,22 @@ export async function fetchMarkets() {
     const stockResults = await Promise.all(symbols.map(fetchStock));
     stockResults.forEach(r => { if (r) markets.push(r); });
 
-    // Crypto
+    // Crypto - now uses ServiceClient with caching and circuit breaker
     try {
-        const cryptoResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true');
-        const crypto = await cryptoResponse.json();
+        const result = await serviceClient.request('COINGECKO', '/api/v3/simple/price', {
+            params: {
+                ids: 'bitcoin,ethereum,solana',
+                vs_currencies: 'usd',
+                include_24hr_change: 'true'
+            }
+        });
 
+        const crypto = result.data;
         if (crypto.bitcoin) markets.push({ name: 'Bitcoin', symbol: 'BTC', price: crypto.bitcoin.usd, change: crypto.bitcoin.usd_24h_change });
         if (crypto.ethereum) markets.push({ name: 'Ethereum', symbol: 'ETH', price: crypto.ethereum.usd, change: crypto.ethereum.usd_24h_change });
         if (crypto.solana) markets.push({ name: 'Solana', symbol: 'SOL', price: crypto.solana.usd, change: crypto.solana.usd_24h_change });
     } catch (error) {
-        console.error('Error fetching crypto:', error);
+        console.error('Error fetching crypto:', error.message);
     }
 
     return markets;
@@ -283,11 +274,11 @@ export async function fetchCongressTrades() {
     // Note: The House Stock Watcher S3 bucket is no longer publicly accessible.
     // This now fetches congressional trading-related news instead.
     try {
-        const apiUrl = 'https://api.rss2json.com/v1/api.json?rss_url=' +
-            encodeURIComponent('https://news.google.com/rss/search?q=congress+stock+trading+disclosure&hl=en-US&gl=US&ceid=US:en');
-        const response = await fetch(apiUrl);
-        const data = await response.json();
+        const result = await serviceClient.request('RSS2JSON', '/v1/api.json', {
+            params: { rss_url: 'https://news.google.com/rss/search?q=congress+stock+trading+disclosure&hl=en-US&gl=US&ceid=US:en' }
+        });
 
+        const data = result.data;
         if (data.status === 'ok' && data.items) {
             return data.items.slice(0, 10).map(item => ({
                 name: item.title.substring(0, 50) + (item.title.length > 50 ? '...' : ''),
@@ -301,7 +292,7 @@ export async function fetchCongressTrades() {
             }));
         }
     } catch (error) {
-        console.error('Error fetching congress trades news:', error);
+        console.error('Error fetching congress trades news:', error.message);
     }
     return [];
 }
@@ -329,23 +320,23 @@ export async function fetchGovContracts() {
     }
 }
 
-// Fetch AI news from major AI companies
+// Fetch AI news from major AI companies - now with ServiceClient
 export async function fetchAINews() {
     const results = await Promise.all(AI_FEEDS.map(async (source) => {
-        // Try rss2json API first
+        // Try rss2json API first with ServiceClient
         try {
-            const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(source.url)}`;
-            const response = await fetch(apiUrl);
-            if (response.ok) {
-                const data = await response.json();
-                if (data.status === 'ok' && data.items) {
-                    return data.items.slice(0, 3).map(item => ({
-                        source: source.name,
-                        title: (item.title || 'No title').trim(),
-                        link: item.link || '',
-                        date: item.pubDate || ''
-                    }));
-                }
+            const result = await serviceClient.request('RSS2JSON', '/v1/api.json', {
+                params: { rss_url: source.url }
+            });
+
+            const data = result.data;
+            if (data.status === 'ok' && data.items) {
+                return data.items.slice(0, 3).map(item => ({
+                    source: source.name,
+                    title: (item.title || 'No title').trim(),
+                    link: item.link || '',
+                    date: item.pubDate || ''
+                }));
             }
         } catch (e) {
             // Fall through to XML proxy
@@ -382,12 +373,15 @@ export async function fetchAINews() {
     return results.flat().sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 15);
 }
 
-// Fetch Fed balance sheet from FRED
+// Fetch Fed balance sheet from FRED - now with ServiceClient
 export async function fetchFedBalance() {
     try {
-        // Use FRED CSV endpoint (no API key required)
-        const response = await fetch('https://fred.stlouisfed.org/graph/fredgraph.csv?id=WALCL&cosd=2024-01-01');
-        const text = await response.text();
+        const result = await serviceClient.request('FRED', '/graph/fredgraph.csv', {
+            params: { id: 'WALCL', cosd: '2024-01-01' },
+            responseType: 'text'
+        });
+
+        const text = result.data;
 
         // Parse CSV (format: observation_date,WALCL)
         const lines = text.trim().split('\n').slice(1); // Skip header
@@ -409,7 +403,7 @@ export async function fetchFedBalance() {
             };
         }
     } catch (error) {
-        console.error('Error fetching Fed balance:', error);
+        console.error('Error fetching Fed balance:', error.message);
     }
 
     return {
@@ -437,12 +431,12 @@ export async function fetchPolymarket() {
     ];
 }
 
-// Fetch earthquake data from USGS
+// Fetch earthquake data from USGS - now with ServiceClient
 export async function fetchEarthquakes() {
     try {
-        const response = await fetch('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson');
-        const data = await response.json();
+        const result = await serviceClient.request('USGS', '/earthquakes/feed/v1.0/summary/4.5_day.geojson', {});
 
+        const data = result.data;
         return data.features.map(f => ({
             id: f.id,
             mag: f.properties.mag,
@@ -453,7 +447,7 @@ export async function fetchEarthquakes() {
             depth: f.geometry.coordinates[2]
         }));
     } catch (error) {
-        console.error('Error fetching earthquakes:', error);
+        console.error('Error fetching earthquakes:', error.message);
         return [];
     }
 }
@@ -469,7 +463,33 @@ export async function fetchLayoffs() {
     }
 }
 
-// Fetch general news from GDELT as fallback for correlation/narrative analysis
+// Helper function for GDELT queries via ServiceClient
+async function fetchGDELTQuery(query, maxrecords = 10) {
+    try {
+        const result = await serviceClient.request('GDELT', '/api/v2/doc/doc', {
+            params: {
+                query: query,
+                mode: 'artlist',
+                maxrecords: maxrecords,
+                format: 'json',
+                sort: 'date'
+            }
+        });
+
+        return (result.data.articles || []).map(article => ({
+            source: article.domain || 'GDELT',
+            title: article.title || '',
+            link: article.url || '',
+            pubDate: article.seendate || '',
+            isAlert: ALERT_KEYWORDS.some(kw => (article.title || '').toLowerCase().includes(kw))
+        }));
+    } catch (error) {
+        console.log(`GDELT query failed: ${query.substring(0, 30)}...`);
+        return [];
+    }
+}
+
+// Fetch general news from GDELT as fallback for correlation/narrative analysis - now with ServiceClient
 export async function fetchGDELTNews() {
     const queries = [
         '(politics OR government OR congress)',
@@ -481,20 +501,7 @@ export async function fetchGDELTNews() {
 
     try {
         const results = await Promise.allSettled(
-            queries.map(async (query) => {
-                const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=10&format=json&sort=date`;
-                const response = await fetch(url);
-                if (!response.ok) return [];
-                const data = await response.json();
-
-                return (data.articles || []).map(article => ({
-                    source: article.domain || 'GDELT',
-                    title: article.title || '',
-                    link: article.url || '',
-                    pubDate: article.seendate || '',
-                    isAlert: ALERT_KEYWORDS.some(kw => (article.title || '').toLowerCase().includes(kw))
-                }));
-            })
+            queries.map(query => fetchGDELTQuery(query, 10))
         );
 
         const items = [];
@@ -518,28 +525,17 @@ export async function fetchGDELTNews() {
     }
 }
 
-// Fetch situation-specific news using GDELT
+// Fetch situation-specific news using GDELT - now with ServiceClient
 export async function fetchSituationNews(keywords, limit = 10) {
     try {
-        const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(keywords)}&mode=artlist&maxrecords=${limit}&format=json&sort=date`;
-        const response = await fetch(url);
-        if (!response.ok) return [];
-
-        const data = await response.json();
-        return (data.articles || []).map(article => ({
-            source: article.domain || 'Unknown',
-            title: article.title || '',
-            link: article.url || '',
-            pubDate: article.seendate || '',
-            isAlert: ALERT_KEYWORDS.some(kw => (article.title || '').toLowerCase().includes(kw))
-        }));
+        return await fetchGDELTQuery(keywords, limit);
     } catch (error) {
         console.error('Error fetching situation news:', error);
         return [];
     }
 }
 
-// Fetch Intel feed using GDELT API (more reliable than RSS)
+// Fetch Intel feed using GDELT API - now with ServiceClient
 export async function fetchIntelFeed() {
     const items = [];
 
@@ -558,22 +554,31 @@ export async function fetchIntelFeed() {
         // Fetch from multiple GDELT queries in parallel
         const results = await Promise.allSettled(
             queries.map(async ({ query, topics, regions }) => {
-                const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=5&format=json&sort=date`;
-                const response = await fetch(url);
-                if (!response.ok) return [];
-                const data = await response.json();
+                try {
+                    const result = await serviceClient.request('GDELT', '/api/v2/doc/doc', {
+                        params: {
+                            query: query,
+                            mode: 'artlist',
+                            maxrecords: 5,
+                            format: 'json',
+                            sort: 'date'
+                        }
+                    });
 
-                return (data.articles || []).map(article => ({
-                    source: article.domain || 'Unknown',
-                    sourceType: article.domain?.includes('.gov') ? 'govt' :
-                               article.domain?.includes('bellingcat') ? 'osint' : 'news',
-                    title: article.title || '',
-                    link: article.url || '',
-                    pubDate: article.seendate || '',
-                    isAlert: ALERT_KEYWORDS.some(kw => (article.title || '').toLowerCase().includes(kw)),
-                    regions: regions,
-                    topics: topics
-                }));
+                    return (result.data.articles || []).map(article => ({
+                        source: article.domain || 'Unknown',
+                        sourceType: article.domain?.includes('.gov') ? 'govt' :
+                                   article.domain?.includes('bellingcat') ? 'osint' : 'news',
+                        title: article.title || '',
+                        link: article.url || '',
+                        pubDate: article.seendate || '',
+                        isAlert: ALERT_KEYWORDS.some(kw => (article.title || '').toLowerCase().includes(kw)),
+                        regions: regions,
+                        topics: topics
+                    }));
+                } catch (e) {
+                    return [];
+                }
             })
         );
 
@@ -604,4 +609,9 @@ export async function fetchIntelFeed() {
         console.error('Error fetching intel feed:', error);
         return [];
     }
+}
+
+// Export serviceClient health status for debugging
+export function getServiceHealth() {
+    return serviceClient.getHealthStatus();
 }
