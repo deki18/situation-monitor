@@ -26,6 +26,8 @@
 	let mapContainer: HTMLDivElement;
 	// D3 objects - initialized in initMap, null before initialization
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	let d3Module: typeof import('d3') | null = null;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	let svg: any = null;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	let mapGroup: any = null;
@@ -182,6 +184,7 @@
 	// Initialize map
 	async function initMap(): Promise<void> {
 		const d3 = await import('d3');
+		d3Module = d3;
 		const topojson = await import('topojson-client');
 
 		const svgEl = mapContainer.querySelector('svg');
@@ -521,11 +524,8 @@
 	}
 
 	function resetZoom(): void {
-		if (!svg || !zoom) return;
-		const d3 = (window as unknown as { d3: typeof import('d3') }).d3;
-		if (d3) {
-			svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
-		}
+		if (!svg || !zoom || !d3Module) return;
+		svg.transition().duration(300).call(zoom.transform, d3Module.zoomIdentity);
 	}
 
 	// Reactively update monitors when they change
